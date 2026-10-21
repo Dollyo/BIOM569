@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+*.tif
+*.tiff
+*.czi
+*.lif
+*.nd2
+*.7z
+*.zip
