@@ -29,8 +29,10 @@
 #   fwhm_results.xlsx with two sheets:
 #     Beads   - one row per bead (all files together), raw and bead-corrected FWHM
 #     Summary - one row per file: bead counts and mean/median/SD of unflagged beads
-#   fit_plots/<file>_fits.png - for each bead, XZ / XY / YZ images on top with
-#     the z/y/x fits underneath, so you can check the fits by eye
+#   fit_plots/<file>_fits.png - for each bead, XZ / XY / YZ images on top (same
+#     µm scale on every axis, so z elongation is visible) with the z/y/x
+#     intensity profiles and Gaussian fits underneath. Each profile plot marks
+#     the FWHM as a horizontal line at half maximum; the key sits below each plot.
 # A file that can't be read (e.g. missing voxel size) is skipped and logged in
 # the Summary sheet instead of stopping the whole run.
 # =============================================================================
@@ -49,6 +51,7 @@ from skimage import filters, measure
 
 # ---------- user settings ----------
 SCRIPT_DIR = Path(__file__).resolve().parent                        # folder this script lives in
+# Images come from the "img" folder next to the script, unless a folder is given on the command line.
 FOLDER   = Path(sys.argv[1]) if len(sys.argv) > 1 else SCRIPT_DIR / "img - example"
 PATTERNS = ("*.tif", "*.tiff")             # which files to pick up
 OUT_XLSX = SCRIPT_DIR / "fwhm_results.xlsx"    # results workbook (next to the script)
@@ -60,6 +63,11 @@ BEAD_D   = 0.100                  # µm, nominal bead diameter (from the bead su
 D_EFF    = BEAD_D * np.sqrt(3)/2  # µm, FWHM contributed by a uniformly filled sphere (use BEAD_D for conservative)
 HALF_BOX = 0.5                    # µm half-width of crop around each bead (use ~0.5 for STED)
 MIN_R2   = 0.93                   # flag fits worse than this (R² = goodness of fit, 1 = perfect)
+
+# --- plot settings (display only, they do not change any measurement) ---
+Z_VIEW_HALF = 1.0                 # µm shown above/below the peak in the XZ and YZ images (x/y show +/- HALF_BOX)
+FIG_WIDTH   = 15                  # inches, width of each fit-plot figure (bigger = more room for labels)
+PLOT_DPI    = 150                 # resolution of the saved PNG (lowered automatically for very tall figures)
 
 # Conversion factors: metadata unit -> µm (all internal maths is done in µm)
 UNIT = {"nm": 1e-3, "µm": 1.0, "um": 1.0, "micron": 1.0, "microns": 1.0, "mm": 1e3}
@@ -133,7 +141,7 @@ def fwhm_1d(profile, step):
 
 # ---------- 3. find beads in one stack and measure them ----------
 def measure_beads(img, vz, vy, vx):
-    """Return (list of per-bead dicts in nm, list of fit curves for plotting, list of (crop, peak) for images)."""
+    """Return (list of per-bead dicts in nm, list of fit info for plotting, list of (crop, peak) for images)."""
     # Step A: locate beads. Max projection along z collapses the stack to one 2D image,
     # a light blur (sigma = 1 px) smooths noise, and Otsu's method picks an automatic
     # brightness threshold. Each connected bright blob is labelled as one bead.
@@ -164,7 +172,8 @@ def measure_beads(img, vz, vy, vx):
             try:
                 fw, r2, xs, popt = fwhm_1d(p, st)
                 out[ax] = fw*1000                                    # µm -> nm
-                fits.append((len(rows), ax, xs, p, gauss(xs, *popt)))   # keep curve for the plot
+                # keep everything the plot needs: data, fit parameters, FWHM (µm) and R²
+                fits.append((len(rows), ax, xs, p, popt, fw, r2))
                 if r2 < MIN_R2: flag.append(f"{ax}:R2={r2:.2f}")     # poor fit
                 if fw > 0.9*xs[-1]: flag.append(f"{ax}:wide")        # FWHM ~ whole crop (likely not a clean bead)
             except (RuntimeError, ValueError):                       # no convergence / invalid input
@@ -188,43 +197,82 @@ def bead_correct(fwhm_nm):
 
 
 def save_fit_plot(name, n_beads, fits, df, crops, vox):
-    """Per bead: a row of XZ/XY/YZ images on top, then the z/y/x profile fits underneath."""
+    """Per bead: a row of XZ/XY/YZ images on top, then the z/y/x intensity profiles with fits underneath."""
     vz, vy, vx = vox
-    # Two plot rows per bead (images, then fits); the image row is a bit taller
-    fig, axs = plt.subplots(2*n_beads, 3, figsize=(10, 4.2*n_beads), squeeze=False,
-                            gridspec_kw={"height_ratios": [1.3, 1]*n_beads})
+
+    # --- figure size ---
+    # The images use the SAME µm scale on every axis (aspect="equal"), so the XZ / YZ
+    # panels are taller than they are wide by the ratio (z window) / (x window).
+    # The image row is made tall enough to hold that, and the profile row is tall
+    # enough to leave room for the key underneath each graph.
+    z_ratio = max(1.0, Z_VIEW_HALF / HALF_BOX)             # z window height relative to x/y window width
+    img_h   = 4.6 * z_ratio                                # inches per bead for the image row
+    prof_h  = 5.0                                          # inches per bead for the profile row
+    total_h = (img_h + prof_h) * n_beads
+    dpi     = int(min(PLOT_DPI, 60000 / total_h))          # keep the PNG under the ~65,000 px limit
+
+    # constrained_layout places colorbars and the legends below the graphs without overlap
+    fig, axs = plt.subplots(2*n_beads, 3, figsize=(FIG_WIDTH, total_h), squeeze=False,
+                            gridspec_kw={"height_ratios": [img_h, prof_h]*n_beads},
+                            constrained_layout=True)
 
     # --- image row for each bead (axes in µm, red crosshairs mark the fitted peak) ---
     for i, (crop, (z, y, x)) in enumerate(crops):
         nz, ny, nx = crop.shape
+        # z window shown in the XZ / YZ images: +/- Z_VIEW_HALF around the peak, clipped to the stack
+        hz = round(Z_VIEW_HALF / vz)
+        z_lo, z_hi = max(0, z - hz), min(nz, z + hz + 1)
         # Each view is a 2D slice through the peak. Tuple fields:
         # (title, 2D slice, extent [left, right, bottom, top] in µm, x-label, y-label, crosshair (h, v))
+        # Crosshairs sit at pixel centres (index + 0.5); z positions are absolute so they match the z profile below.
         views = [
-            ("XZ", crop[:, y, :], [0, nx*vx, nz*vz, 0], "x (µm)", "z (µm)", (z*vz, x*vx)),   # side view
-            ("XY", crop[z, :, :], [0, nx*vx, ny*vy, 0], "x (µm)", "y (µm)", (y*vy, x*vx)),   # top-down view
-            ("YZ", crop[:, :, x], [0, ny*vy, nz*vz, 0], "y (µm)", "z (µm)", (z*vz, y*vy)),   # other side view
+            ("XZ side view",     crop[z_lo:z_hi, y, :], [0, nx*vx, z_hi*vz, z_lo*vz],
+             "x position (µm)", "z position (µm)", ((z+0.5)*vz, (x+0.5)*vx)),
+            ("XY top-down view", crop[z, :, :],         [0, nx*vx, ny*vy, 0],
+             "x position (µm)", "y position (µm)", ((y+0.5)*vy, (x+0.5)*vx)),
+            ("YZ side view",     crop[z_lo:z_hi, :, x], [0, ny*vy, z_hi*vz, z_lo*vz],
+             "y position (µm)", "z position (µm)", ((z+0.5)*vz, (y+0.5)*vy)),
         ]
         for j, (title, sl, ext, xl, yl, (h, v)) in enumerate(views):
             a = axs[2*i][j]
-            a.imshow(sl, cmap="gray", extent=ext, aspect="auto")     # use aspect="equal" for true proportions
-            a.axhline(h, color="r", lw=0.5, alpha=0.6)               # horizontal crosshair line
-            a.axvline(v, color="r", lw=0.5, alpha=0.6)               # vertical crosshair line
-            a.set_title(f"bead {i} {title}", fontsize=8)
-            a.set_xlabel(xl, fontsize=7); a.set_ylabel(yl, fontsize=7)
-            a.tick_params(labelsize=6)
+            # aspect="equal": one µm is the same length on both axes, so z elongation is shown true to scale
+            im = a.imshow(sl, cmap="gray", extent=ext, aspect="equal")
+            a.axhline(h, color="r", lw=0.6, alpha=0.7)               # horizontal crosshair line
+            a.axvline(v, color="r", lw=0.6, alpha=0.7)               # vertical crosshair line
+            a.set_title(f"Bead {i} - {title}", fontsize=10)
+            a.set_xlabel(xl, fontsize=9); a.set_ylabel(yl, fontsize=9)
+            a.tick_params(labelsize=8)
+            cb = fig.colorbar(im, ax=a, fraction=0.046, pad=0.03)    # greyscale key
+            cb.set_label("intensity (a.u.)", fontsize=8)
+            cb.ax.tick_params(labelsize=7)
 
-    # --- fit graphs directly underneath: dots = data, line = Gaussian fit, title = FWHM ---
-    for i, ax, xs, p, fit in fits:
+    # --- profile graphs directly underneath: dots = data, line = Gaussian fit,
+    #     dashed horizontal line = FWHM drawn at half of the peak height above background ---
+    for i, ax, xs, p, popt, fw, r2 in fits:
         j = "zyx".index(ax)                                          # column: z=0, y=1, x=2
         a = axs[2*i+1][j]
-        a.plot(xs, p, "o", ms=3)
-        a.plot(xs, fit, "-")
-        a.set_title(f"bead {i} {ax}: {df.loc[i, RAW_COLS[j]]:.0f} nm", fontsize=8)
+        A, mu, sig, off = popt
+        fine = np.linspace(xs[0], xs[-1], 300)                       # dense grid so the fit line is smooth
+        half = off + A/2                                             # half-maximum intensity level
+        a.plot(xs, p, "o", ms=4, color="tab:blue", label="data (one point per voxel)")
+        a.plot(fine, gauss(fine, *popt), "-", color="tab:orange", label="Gaussian fit")
+        a.hlines(half, mu - fw/2, mu + fw/2, colors="k", linestyles="--", lw=1.4,
+                 label=f"FWHM = {fw*1000:.0f} nm")
+        a.set_xlabel(f"{ax} position along profile (µm)", fontsize=9)
+        a.set_ylabel("intensity (a.u.)", fontsize=9)
+        a.tick_params(labelsize=8)
+        # Key placed BELOW the graph (outside the axes) so it can never cover the data or the fit
+        a.legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=2, frameon=False)
+        flags = df.loc[i, "flags"]
+        title = f"Bead {i} - {ax} profile (R² = {r2:.2f})"
+        if flags:                                                    # show warnings in red on the plot
+            a.set_title(f"{title}\nFLAGGED: {flags}", fontsize=9, color="red")
+        else:
+            a.set_title(title, fontsize=10)
 
-    fig.suptitle(name, fontsize=9)
-    fig.tight_layout()
+    fig.suptitle(name, fontsize=12)
     PLOT_DIR.mkdir(exist_ok=True)
-    fig.savefig(PLOT_DIR / f"{Path(name).stem}_fits.png", dpi=150)
+    fig.savefig(PLOT_DIR / f"{Path(name).stem}_fits.png", dpi=dpi)
     plt.close(fig)                                  # free memory; many files in a row
 
 
