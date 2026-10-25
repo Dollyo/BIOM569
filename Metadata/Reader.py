@@ -110,6 +110,9 @@ def step_nm(n, length_m):
     return None
 
 
+DATE_FORMAT = "%d/%m/%y"          # dd/mm/yy ; --with-time switches to "%d/%m/%y %H:%M:%S"
+
+
 def get_timestamps(image):
     """List of local-time strings, one per timestamp token in TimeStampList."""
     ts = image.find("./TimeStampList")
@@ -120,7 +123,7 @@ def get_timestamps(image):
         try:
             ticks = (int(tok.split(":")[0], 16) << 32 | int(tok.split(":")[1], 16)) if ":" in tok else int(tok, 16)
             dt = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks / 10)
-            out.append(dt.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+            out.append(dt.astimezone().strftime(DATE_FORMAT))
         except Exception:
             out.append("")
     return out
@@ -228,26 +231,22 @@ def extract_setting(defn, fallback):
             r["Gate end (ns)"] = fmt((to_float(dg.get("End")) or 0) * 1e9, 4)
     r["TauSTED strength (%)"] = r["Xtend strength (%)"] = ""
     xtend = False
-    if gmode == "9" and tsd is not None:                # TauSTED
-        r["TauSTED strength (%)"] = fmt((to_float(tsd.get("Strength")) or 0) * 100, 5)
-        if tsd.get("TimegateActive") == "1":
-            r["Gate start (ns)"] = fmt((to_float(tsd.get("TimegateBegin")) or 0) * 1e9, 4)
-            r["Gate end (ns)"] = fmt((to_float(tsd.get("TimegateEnd")) or 0) * 1e9, 4)
-        if tsd.get("Deconvolution") == "1":             # TauSTED + deconvolution = Xtend
-            xtend = True
-            try:
-                r["Xtend strength (%)"] = ET.fromstring(tsd.get("DeconvolutionParameters")).findtext("Strength") or ""
-            except Exception:
-                pass
+    if gmode == "9" and tsd is not None:                # TauSTED (+ deconvolution = Xtend)
+        strength = fmt((to_float(tsd.get("Strength")) or 0) * 100, 5)   # stored as a fraction
+        xtend = tsd.get("Deconvolution") == "1"
+        # LAS X has a single Strength slider; it is reported under the active mode.
+        r["Xtend strength (%)" if xtend else "TauSTED strength (%)"] = strength
+        # TauSTED time-gate window (stored even when the gate itself is switched off)
+        r["Gate start (ns)"] = fmt((to_float(tsd.get("TimegateBegin")) or 0) * 1e9, 4)
+        r["Gate end (ns)"] = fmt((to_float(tsd.get("TimegateEnd")) or 0) * 1e9, 4)
 
-    # Mode label
-    sted_on = sted_pct > 0
-    if gmode == "9":
+    # Mode label (names match the Modes sheet of STED_settings.xlsx)
+    if not sted_pct > 0:
+        r["Mode"] = "Confocal"
+    elif gmode == "9":
         r["Mode"] = "TauSTED Xtend" if xtend else "TauSTED"
-    elif gmode == "3":
-        r["Mode"] = "Gated STED" if sted_on else "Gated confocal"
     else:
-        r["Mode"] = "STED" if sted_on else "Confocal"
+        r["Mode"] = "Intensity"
 
     r["Emission wavelength for pinhole (nm)"] = fmt(attr("EmissionWavelengthForPinholeAiryCalculation"))
     r["Pinhole (AU)"] = fmt(attr("PinholeAiry"), 3)
@@ -319,7 +318,11 @@ def build_rows(lif_path, trail, name, image, index, args, peak_reader):
         row.update(extract_setting(defn, top))
         row["Date"] = times[ch] if per_channel and ch < len(times) else (times[0] if times else "")
         row["Operator"] = args.operator
-        row["File name"] = f"{Path(lif_path).name} / {'/'.join(trail + [name])}{suffix}"
+        path_parts = [p for p in trail + [name] if p]
+        stem = Path(lif_path).name
+        if len(path_parts) > 1 and path_parts[0].lower() in (stem.lower(), Path(lif_path).stem.lower()):
+            path_parts = path_parts[1:]          # top-level element is just the .lif name again
+        row["File name"] = f"{stem} / {'/'.join(path_parts)}{suffix}"
         if nx:
             row["Size x-y-z"] = f"{nx} x {ny} x {nz}"
         if px:
@@ -378,11 +381,15 @@ def main():
     ap.add_argument("files", nargs="*", help=".lif files (omit to pick files in a dialog)")
     ap.add_argument("-o", "--output", default="lif_metadata.csv")
     ap.add_argument("--operator", default="")
+    ap.add_argument("--with-time", action="store_true", help="write dates as dd/mm/yy HH:MM:SS instead of dd/mm/yy")
     ap.add_argument("--no-peak", dest="peak", action="store_false", help="skip peak-photon calculation")
     ap.add_argument("--dump", action="store_true", help="print HardwareSetting attributes (saved to lif_dump.txt) and exit")
     ap.add_argument("--series", default=None, help="with --dump: only the series with this exact name")
     ap.add_argument("--grep", default=None, help="with --dump: only lines matching this regex")
     args = ap.parse_args()
+    global DATE_FORMAT
+    if args.with_time:
+        DATE_FORMAT = "%d/%m/%y %H:%M:%S"
 
     if not args.files:
         args.files = list(DEFAULT_FILES) or pick_files()
